@@ -54,6 +54,45 @@
   `timeout-unknown`，调用方不得据此认为已提交；可用相同
   `(sessionID, requestID)` 重试，由 reply cache 收敛到真实结论。
 
+### 1.5 原子批量写与条件更新
+批量请求（`CmdBatch`）是一条普通 raft 日志条目，因此天然继承单键写的
+全部保证：多数派提交、旧任期不可覆盖、崩溃重放确定、reply cache 幂等。
+
+- **全有或全无**：状态机先对全部项求值前置条件（phase 1），全部满足后才
+  一次性改 map（phase 2）；读路径与提交路径共用同一把锁，任何读都看不到
+  只改了一半的中间状态。失败时不写任何键、不推进任何键版本。
+- **结构性拒绝**（不读状态、各节点确定一致）返回 `invalid-batch`：
+  空批次（`empty-batch`）、空键（`empty-key`）、键过长（`key-too-long`）、
+  值过长（`value-too-long`）、批次内重复键（`duplicate-key`，绝不悄悄选
+  一个值）、项数超限（`too-many-items`）、总载荷超限
+  （`payload-too-large`）、非法前置版本（`bad-expect-version`）。
+  阈值见 `MaxBatchItems/MaxKeyLen/MaxValueLen/MaxBatchPayload`。
+- **版本规则与前置条件**：
+  - 每个键有单调版本；首次成功写入为 1，之后每生效一次（单键 put 或
+    批量项）+1。失败/被拒的请求不改版本；版本随快照持久化。
+  - `expect_version`：省略=无条件覆盖写；`0`=键**必须不存在**
+    （create-if-absent）；`v>0`=键必须存在且当前版本**恰好**为 v。
+  - 不满足时整体返回 `precondition-failed`，原因可区分为
+    `key-already-exists`（要求不存在但存在）、`key-not-exists`
+    （要求某版本但不存在）、`version-mismatch`（存在但版本不符），
+    并在结论里给出 `failed_key`、`expect_version`、`actual_version`。
+  - 两个客户端并发基于同一旧版本更新时，由于条件在**串行化的日志应用点**
+    求值，最多一个成功；失败方拿到上述确定原因。它与领导者切换/超时导致
+    的 `timeout-unknown` 是**不同的结论**，调用方不会把"输了竞争"误判为
+    "结果未知"。
+- **幂等与恢复**：批量的完整首个结论（含提交位置 `applied_at`、每键结果、
+  每键生效版本、失败详情）原样存入 reply cache 并随快照保存。用同一个
+  `(sessionID, requestID)` 重发时——无论首次是成功、结构性拒绝还是条件
+  失败，也无论之后别的写入是否已改动这些键——都返回 `duplicate` +
+  **第一次的原始结论**，绝不按新状态重新判断条件，也绝不只应用一部分。
+- **与单键能力的兼容**：单键 `put/get` 的报文、结论与 TTL 语义不变，只是
+  响应额外带 `version`（读也带当前版本）；版本表是快照中的附加字段，旧
+  快照恢复时按现存键补版本 1。
+- **超时/领导者切换下的重试**：分区中的 leader 拿不到多数，批量不会提交
+  （`timeout-unknown`，结果未知）；恢复后用同一 request id 向新 leader
+  重发：若旧条目已随恢复提交则 reply cache 返回原结论，否则作为新条目
+  提交——两种情况都收敛到**唯一确定结论**，键只受这一次影响。
+
 ---
 
 ## 2. 故障处理规则（以及如何区分）
@@ -73,6 +112,8 @@
 | `dropped-node-down` | 目标已崩溃（投递时判定） | 消息未送达 |
 | `duplicate` | 同请求在途合并 | 不重复应用，等待原提案结论 |
 | `timeout-unknown` | 超时未确认 | 结果未知，**禁止当作已提交** |
+| `invalid-batch` | 批量结构非法（空批次/空键/重复键/超限） | 确定拒绝，无任何键生效；原因细分 |
+| `precondition-failed` | 某项期望版本与当前不符 | 确定拒绝，整体不生效；带 `failed_key` 与期望/实际版本 |
 | `closing` | 节点关闭中 | 拒绝 |
 
 关键不变量：
@@ -143,6 +184,16 @@ go test ./internal/sim/ -run TestPartitionCrashMembershipRestartCombined -v
 - `TestIdempotentDuplicateWriteAppliedOnce` /
   `TestExpiredSessionRejectedExplicitly` / `TestProposalOnFollowerRejected`
 - `TestLinearizableReadBarrier` / `TestReadFailsWithoutQuorum`
+- 批量与条件写（`internal/sim/acceptance_batch_test.go`、
+  `internal/kv/batch_test.go`、`internal/kv/batch_service_test.go`）：
+  - `TestBatchMultiKeyCommitsAndConverges`（多键原子提交并收敛）
+  - `TestBatchPreconditionFailureConvergesAllOrNothing`（条件失败全有或全无）
+  - `TestBatchDuplicateAfterInterveningWrites`（重复请求返回原始结论）
+  - `TestBatchRetryAfterPartitionConverges`（分区/领导切换后同 request 重试收敛）
+  - `TestBatchLeaderCrashRestartKeepsVerdict`（崩溃重启后结论与版本保留）
+  - `TestBatchConcurrentConditionalRace`（并发条件更新恰一个成功，失败可区分）
+  - `TestBatchStructuralValidation`（重复键/空键/超限）/
+    `TestBatchCreateIfAbsent` / `TestBatchSnapshotRestorePreservesVersionsAndReplies`
 - `TestPartitionCrashMembershipRestartCombined`（分区+崩溃+重启+成员变更）
 - 存储：`TestFileStorageRestartReplays`、
   `TestFileStorageSnapshotAcrossRestart`、`TestFileStorageTornTailFrame`
@@ -164,6 +215,11 @@ go run ./cmd/client -servers $S status
 SID=$(go run ./cmd/client -servers $S session-open | sed -n 's/.*"session": "\([^"]*\)".*/\1/p')
 go run ./cmd/client -servers $S put  $SID r1 color blue
 go run ./cmd/client -servers $S get  $SID r2 color
+# 原子批量（一个 request 编号；@后是期望版本：0=必须不存在，N=必须当前是 vN）
+go run ./cmd/client -servers $S batch $SID b1 cfg/a=1 cfg/b=2
+go run ./cmd/client -servers $S batch $SID b2 cfg/c=new@0
+go run ./cmd/client -servers $S batch $SID b3 cfg/a=99@1
+# 若超时/换主，用完全相同的 b1 重发：得到第一次的原始结论（duplicate），不重复生效
 # 杀掉一个进程后重放同一条 put（相同 r1）观察 duplicate/同一结论
 # kill -9 后用相同命令重启，观察从 WAL/快照恢复
 go run ./cmd/client -servers $S member-add n4 127.0.0.1:9104

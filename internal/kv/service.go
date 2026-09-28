@@ -150,7 +150,7 @@ func (s *Service) correlate(e raft.Entry, res Result) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch cmd.Type {
-	case CmdPut:
+	case CmdPut, CmdBatch:
 		if m := s.puts[cmd.SessionID]; m != nil {
 			if p := m[cmd.RequestID]; p != nil {
 				res.Leader = s.node.Leader()
@@ -212,9 +212,10 @@ func (s *Service) handleEvent(e raft.Event) {
 	}
 }
 
-// proposePut submits a write with an explicit timeout. Registration of
-// the waiter is atomic so concurrent duplicates share one proposal.
-func (s *Service) proposePut(cmd Command, timeout time.Duration) Result {
+// proposeWrite submits a write (single put or atomic batch) with an
+// explicit timeout. Registration of the waiter is atomic so concurrent
+// duplicates share one proposal and all get the same terminal result.
+func (s *Service) proposeWrite(cmd Command, timeout time.Duration) Result {
 	if s.node.Role() != raft.RoleLeader {
 		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
 			Reason: raft.RejectNotLeader.String()}
@@ -305,7 +306,43 @@ func (s *Service) Put(sessionID, requestID, key string, value []byte) Result {
 	}
 	cmd := Command{Type: CmdPut, SessionID: sessionID, RequestID: requestID,
 		Key: key, Value: value, CreateTime: s.clock().UnixMilli()}
-	return s.proposePut(cmd, 2*time.Second)
+	return s.proposeWrite(cmd, 2*time.Second)
+}
+
+// Batch proposes an atomic multi-key write. Each item may carry an
+// expected-version precondition (BatchExpectAbsent for "must not exist").
+// The returned Result is decisive:
+//
+//   - VerdictOK: every item applied at Result.Batch.AppliedAt, with the
+//     resulting per-key versions in Result.Batch.Ops;
+//   - VerdictInvalidBatch / VerdictPreconditionFailed: nothing applied,
+//     Result.Batch explains which key/condition failed;
+//   - VerdictTimeout: outcome UNKNOWN — the batch may or may not have
+//     committed. Retry with the SAME (sessionID, requestID); the reply
+//     cache returns the original verdict instead of reapplying.
+func (s *Service) Batch(sessionID, requestID string, items []BatchItem) Result {
+	if s.node.Role() != raft.RoleLeader {
+		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
+			Reason: raft.RejectNotLeader.String()}
+	}
+	known, closed := s.store.HasSession(sessionID)
+	if !known || closed {
+		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
+	}
+	// Fast path: same (session, request) already applied => return the
+	// original, complete batch verdict without touching raft.
+	if rep, ok := s.store.PendingPut(sessionID, requestID); ok {
+		return Result{Verdict: VerdictDuplicate, Reason: "request-already-applied",
+			Index: rep.AppliedAt, Batch: rep.Batch}
+	}
+	ops := make([]BatchOp, len(items))
+	for i, it := range items {
+		ops[i] = BatchOp{Key: it.Key, Value: it.Value,
+			ExpectVersion: it.ExpectVersion}
+	}
+	cmd := Command{Type: CmdBatch, SessionID: sessionID, RequestID: requestID,
+		Ops: ops, CreateTime: s.clock().UnixMilli()}
+	return s.proposeWrite(cmd, 2*time.Second)
 }
 
 // joinOrRegisterPut atomically joins an in-flight request or registers

@@ -18,6 +18,9 @@ const (
 	CmdSessionOpen CmdType = iota
 	CmdSessionClose
 	CmdPut
+	// CmdBatch applies several key updates atomically, optionally each
+	// guarded by an expected-version precondition.
+	CmdBatch
 )
 
 // Command is the application payload carried inside an EntryData.
@@ -29,6 +32,9 @@ type Command struct {
 	Value      []byte
 	TTLMillis  int64 // session idle expiration (CmdSessionOpen)
 	CreateTime int64 // for deterministic TTL tests
+
+	// Ops carries the update items of a CmdBatch request.
+	Ops []BatchOp
 }
 
 // Reply is the machine-readable result recorded once per request so a
@@ -38,6 +44,11 @@ type Reply struct {
 	Value     []byte
 	Reason    string
 	AppliedAt raft.Index
+	// Version is the post-write version for single-key puts (0 when the
+	// request was not a successful write).
+	Version int64
+	// Batch holds the full original verdict of a CmdBatch request.
+	Batch *BatchResult
 }
 
 // Verdict is the machine-readable result of one request.
@@ -51,6 +62,12 @@ const (
 	VerdictDuplicate
 	VerdictNotLeader
 	VerdictTimeout
+	// VerdictInvalidBatch: the batch itself is malformed (empty batch,
+	// empty/duplicate key, size limit). Nothing was applied.
+	VerdictInvalidBatch
+	// VerdictPreconditionFailed: at least one item's expected-version
+	// precondition did not match. Nothing was applied.
+	VerdictPreconditionFailed
 )
 
 func (v Verdict) String() string {
@@ -69,6 +86,10 @@ func (v Verdict) String() string {
 		return "not-leader"
 	case VerdictTimeout:
 		return "timeout-unknown"
+	case VerdictInvalidBatch:
+		return "invalid-batch"
+	case VerdictPreconditionFailed:
+		return "precondition-failed"
 	default:
 		return "unknown"
 	}
@@ -81,6 +102,11 @@ type Result struct {
 	Leader  raft.NodeID
 	Reason  string
 	Index   raft.Index
+	// Version is the resulting key version of a successful single-key
+	// write (read responses do not populate it; see Store.VersionOf).
+	Version int64
+	// Batch is populated for CmdBatch verdicts with per-key detail.
+	Batch *BatchResult
 }
 
 type session struct {
@@ -97,6 +123,7 @@ type session struct {
 type Store struct {
 	mu       sync.RWMutex
 	kv       map[string][]byte
+	versions map[string]int64 // per-key monotonic version; absent => 0
 	sessions map[string]*session
 }
 
@@ -104,6 +131,7 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{
 		kv:       map[string][]byte{},
+		versions: map[string]int64{},
 		sessions: map[string]*session{},
 	}
 }
@@ -122,7 +150,12 @@ func (s *Store) Apply(e raft.Entry) (Result, bool) {
 	s.mu.Lock()
 	res := s.applyLocked(cmd, e.Index)
 	s.mu.Unlock()
-	res.Index = e.Index
+	// Keep an index chosen by the state machine (e.g. a duplicate's
+	// ORIGINAL commit position); otherwise attribute the verdict to the
+	// entry at which it was (re)evaluated.
+	if res.Index == 0 {
+		res.Index = e.Index
+	}
 	return res, true
 }
 
@@ -164,14 +197,20 @@ func (s *Store) applyLocked(cmd Command, idx raft.Index) Result {
 		// Idempotency: a repeated (session, request) returns first verdict.
 		if rep, ok := sess.Replies[cmd.RequestID]; ok {
 			return Result{Verdict: VerdictDuplicate, Value: rep.Value,
-				Reason: "request-already-applied", Index: rep.AppliedAt}
+				Reason: "request-already-applied", Index: rep.AppliedAt,
+				Version: rep.Version}
 		}
 		s.kv[cmd.Key] = append([]byte(nil), cmd.Value...)
+		next := s.versions[cmd.Key] + 1
+		s.versions[cmd.Key] = next
 		if cmd.CreateTime > sess.LastUsedMillis {
 			sess.LastUsedMillis = cmd.CreateTime
 		}
-		sess.Replies[cmd.RequestID] = Reply{Verdict: VerdictOK, AppliedAt: idx}
-		return Result{Verdict: VerdictOK}
+		sess.Replies[cmd.RequestID] = Reply{Verdict: VerdictOK, AppliedAt: idx,
+			Version: next}
+		return Result{Verdict: VerdictOK, Index: idx, Version: next}
+	case CmdBatch:
+		return s.applyBatchLocked(cmd, idx)
 	default:
 		return Result{Verdict: VerdictRejected, Reason: "unknown-command"}
 	}
@@ -199,7 +238,8 @@ func (s *Store) Read(sessionID, key string, nowMillis int64) Result {
 	if !ok {
 		return Result{Verdict: VerdictNotFound, Reason: "no-such-key"}
 	}
-	return Result{Verdict: VerdictOK, Value: append([]byte(nil), v...)}
+	return Result{Verdict: VerdictOK, Value: append([]byte(nil), v...),
+		Version: s.versions[key]}
 }
 
 // HasSession reports session existence/state (used by the service to
@@ -235,7 +275,11 @@ func (s *Store) Snapshot() ([]byte, error) {
 	for k, v := range s.kv {
 		kvCopy[k] = append([]byte(nil), v...)
 	}
-	sd := snapData{Kv: kvCopy, Sessions: map[string]sessionSnap{}}
+	verCopy := make(map[string]int64, len(s.versions))
+	for k, v := range s.versions {
+		verCopy[k] = v
+	}
+	sd := snapData{Kv: kvCopy, Versions: verCopy, Sessions: map[string]sessionSnap{}}
 	for id, sess := range s.sessions {
 		cp := sessionSnap{
 			CreatedMillis:  sess.CreatedMillis,
@@ -258,6 +302,16 @@ func (s *Store) Restore(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.kv = sd.Kv
+	s.versions = sd.Versions
+	if s.versions == nil {
+		// Backward compatibility: snapshots written before versions
+		// existed. Derive version 1 for every present key so later
+		// conditional writes see a monotonic, collision-free history.
+		s.versions = map[string]int64{}
+		for k := range s.kv {
+			s.versions[k] = 1
+		}
+	}
 	s.sessions = map[string]*session{}
 	for id, cp := range sd.Sessions {
 		s.sessions[id] = &session{
@@ -280,6 +334,9 @@ func (s *Store) Equal(o *Store) (bool, string) {
 	for k, v := range s.kv {
 		if !bytes.Equal(v, o.kv[k]) {
 			return false, "key " + k + " differs"
+		}
+		if s.versions[k] != o.versions[k] {
+			return false, "key " + k + " version differs"
 		}
 	}
 	if len(s.sessions) != len(o.sessions) {

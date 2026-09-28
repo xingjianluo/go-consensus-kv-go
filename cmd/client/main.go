@@ -9,6 +9,8 @@
 //	go run ./cmd/client -servers 127.0.0.1:10101,127.0.0.1:10102,127.0.0.1:10103 session-open
 //	go run ./cmd/client -servers ... put <session> <req-id> <key> <value>
 //	go run ./cmd/client -servers ... get <session> <req-id> <key>
+//	go run ./cmd/client -servers ... batch <session> <req-id> <k=v[@ver]> ...
+//	# ver: 0 = key must not exist; N>0 = key must be at version N; omitted = any
 //	go run ./cmd/client -servers ... member-add <id> <raft-addr>
 //	go run ./cmd/client -servers ... member-remove <id>
 //	status
@@ -22,6 +24,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,7 +34,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: client <status|session-open|put|get|member-add|member-remove> ...")
+		fmt.Fprintln(os.Stderr, "usage: client <status|session-open|put|get|batch|member-add|member-remove> ...")
 		os.Exit(2)
 	}
 	cl := &client{
@@ -49,6 +53,9 @@ func main() {
 	case "get":
 		require(args, 4, "get <session> <req-id> <key>")
 		err = cl.get(args[1], args[2], args[3])
+	case "batch":
+		require(args, 4, "batch <session> <req-id> <k=v[@ver]> ...")
+		err = cl.batch(args[1], args[2], args[3:])
 	case "member-add":
 		require(args, 3, "member-add <id> <raft-addr>")
 		err = cl.memberAdd(args[1], args[2])
@@ -171,6 +178,39 @@ func (c *client) put(session, req, key, value string) error {
 func (c *client) get(session, req, key string) error {
 	m, err := c.do("/kv/get", map[string]string{
 		"session": session, "request": req, "key": key,
+	})
+	return c.print(m, err)
+}
+
+// batch parses items of the form key=value or key=value@expectVersion.
+// expectVersion 0 means "key must not exist"; a positive v pins the
+// current version. The whole request is atomic on the server.
+func (c *client) batch(session, req string, raw []string) error {
+	type op struct {
+		Key           string `json:"key"`
+		Value         string `json:"value"`
+		ExpectVersion *int64 `json:"expect_version,omitempty"`
+	}
+	ops := make([]op, 0, len(raw))
+	for _, item := range raw {
+		eq := strings.IndexByte(item, '=')
+		if eq <= 0 {
+			return fmt.Errorf("bad batch item %q: want key=value[@ver]", item)
+		}
+		key, rest := item[:eq], item[eq+1:]
+		o := op{Key: key, Value: rest}
+		if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+			// '@' inside the value without a trailing integer is literal.
+			suffix := rest[at+1:]
+			if v, perr := strconv.ParseInt(suffix, 10, 64); perr == nil {
+				o.Value = rest[:at]
+				o.ExpectVersion = &v
+			}
+		}
+		ops = append(ops, o)
+	}
+	m, err := c.do("/kv/batch", map[string]any{
+		"session": session, "request": req, "ops": ops,
 	})
 	return c.print(m, err)
 }

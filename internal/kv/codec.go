@@ -15,6 +15,7 @@ func Decode(b []byte) (Command, error) {
 // snapData is the on-snapshot representation of the whole store.
 type snapData struct {
 	Kv       map[string][]byte
+	Versions map[string]int64
 	Sessions map[string]sessionSnap
 }
 

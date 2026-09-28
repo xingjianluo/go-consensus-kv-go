@@ -36,6 +36,7 @@ func serveAdmin(raftAddr string, id raft.NodeID, node *raft.Node, store *kv.Stor
 	mux.HandleFunc("/session/close", st.sessionClose)
 	mux.HandleFunc("/kv/put", st.kvPut)
 	mux.HandleFunc("/kv/get", st.kvGet)
+	mux.HandleFunc("/kv/batch", st.kvBatch)
 	mux.HandleFunc("/member/add", st.memberAdd)
 	mux.HandleFunc("/member/remove", st.memberRemove)
 	srv := &http.Server{Addr: httpAddr, Handler: mux, ReadTimeout: 10 * time.Second}
@@ -107,11 +108,15 @@ func (st *adminState) kvPut(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	_ = json.Unmarshal(body, &req)
 	res := st.svc.Put(req.Session, req.Request, req.Key, []byte(req.Value))
-	writeJSON(w, httpStatus(res), map[string]any{
+	out := map[string]any{
 		"verdict": res.Verdict.String(), "reason": res.Reason,
 		"leader": res.Leader, "index": res.Index,
 		"note": timeoutNote(res),
-	})
+	}
+	if res.Version > 0 {
+		out["version"] = res.Version
+	}
+	writeJSON(w, httpStatus(res), out)
 }
 
 func (st *adminState) kvGet(w http.ResponseWriter, r *http.Request) {
@@ -127,8 +132,59 @@ func (st *adminState) kvGet(w http.ResponseWriter, r *http.Request) {
 		"verdict": res.Verdict.String(), "reason": res.Reason,
 		"leader": res.Leader, "index": res.Index,
 	}
-	if len(res.Value) > 0 {
+	if res.Verdict == kv.VerdictOK || res.Verdict == kv.VerdictDuplicate {
 		out["value"] = string(res.Value)
+		out["version"] = res.Version
+	}
+	writeJSON(w, httpStatus(res), out)
+}
+
+// batchItemJSON is the wire form of one batch update item. ExpectVersion
+// semantics: omitted = unconditional; 0 = key must not exist; v>0 = key
+// must be at exactly version v.
+type batchItemJSON struct {
+	Key           string `json:"key"`
+	Value         string `json:"value"`
+	ExpectVersion *int64 `json:"expect_version,omitempty"`
+}
+
+func (st *adminState) kvBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session string          `json:"session"`
+		Request string          `json:"request"`
+		Ops     []batchItemJSON `json:"ops"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"verdict": kv.VerdictInvalidBatch.String(), "reason": "bad-json"})
+		return
+	}
+	items := make([]kv.BatchItem, len(req.Ops))
+	for i, op := range req.Ops {
+		items[i] = kv.BatchItem{Key: op.Key, Value: []byte(op.Value),
+			ExpectVersion: op.ExpectVersion}
+	}
+	res := st.svc.Batch(req.Session, req.Request, items)
+	out := map[string]any{
+		"verdict": res.Verdict.String(), "reason": res.Reason,
+		"leader": res.Leader, "index": res.Index,
+		"note": timeoutNote(res),
+	}
+	if res.Batch != nil {
+		out["applied_at"] = res.Batch.AppliedAt
+		out["failed_key"] = res.Batch.FailedKey
+		if res.Batch.FailedKey != "" {
+			out["expect_version"] = res.Batch.ExpectVersion
+			out["actual_version"] = res.Batch.ActualVersion
+		}
+		ops := make([]map[string]any, 0, len(res.Batch.Ops))
+		for _, op := range res.Batch.Ops {
+			ops = append(ops, map[string]any{
+				"key": op.Key, "index": op.Index, "version": op.Version,
+			})
+		}
+		out["ops"] = ops
 	}
 	writeJSON(w, httpStatus(res), out)
 }
