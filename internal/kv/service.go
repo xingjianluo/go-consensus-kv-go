@@ -150,7 +150,7 @@ func (s *Service) correlate(e raft.Entry, res Result) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch cmd.Type {
-	case CmdPut:
+	case CmdPut, CmdBatch:
 		if m := s.puts[cmd.SessionID]; m != nil {
 			if p := m[cmd.RequestID]; p != nil {
 				res.Leader = s.node.Leader()
@@ -301,10 +301,48 @@ func (s *Service) Put(sessionID, requestID, key string, value []byte) Result {
 	// original verdict without touching raft.
 	if rep, ok := s.store.PendingPut(sessionID, requestID); ok {
 		return Result{Verdict: VerdictDuplicate, Value: rep.Value, Index: rep.AppliedAt,
-			Reason: "request-already-applied"}
+			Version: rep.Version, Reason: "request-already-applied"}
 	}
 	cmd := Command{Type: CmdPut, SessionID: sessionID, RequestID: requestID,
 		Key: key, Value: value, CreateTime: s.clock().UnixMilli()}
+	return s.proposePut(cmd, 2*time.Second)
+}
+
+// Batch proposes an atomic multi-key write (optionally with per-key
+// expected-version preconditions).
+//
+// Semantics:
+//   - all items commit together, or none do; readers never see a half batch;
+//   - duplicate keys, empty keys and oversize requests are rejected with a
+//     deterministic batch-* reason before anything is proposed;
+//   - a precondition failure is a definitive committed verdict
+//     (VerdictPreconditionFailed naming the offending key), never confused
+//     with VerdictTimeout ("outcome unknown");
+//   - retries with the same (session, request) return the original full
+//     verdict (index, per-key outcomes, post-write versions) even after
+//     later writes moved the state on.
+func (s *Service) Batch(sessionID, requestID string, items []BatchItem) Result {
+	if s.node.Role() != raft.RoleLeader {
+		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
+			Reason: raft.RejectNotLeader.String()}
+	}
+	known, closed := s.store.HasSession(sessionID)
+	if !known || closed {
+		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
+	}
+	// Fast path: same (session, request) already has a recorded verdict.
+	if rep, ok := s.store.PendingPut(sessionID, requestID); ok {
+		return Result{Verdict: VerdictDuplicate, Value: rep.Value, Index: rep.AppliedAt,
+			Version: rep.Version, Items: cloneOutcomes(rep.Items),
+			Reason: "request-already-applied"}
+	}
+	// Structural shape is identical on every node and time-independent, so
+	// reject it locally with the same reason code the state machine uses.
+	if outs, reason, bad := validateBatch(items); bad {
+		return Result{Verdict: VerdictRejected, Reason: reason, Items: outs}
+	}
+	cmd := Command{Type: CmdBatch, SessionID: sessionID, RequestID: requestID,
+		Items: items, CreateTime: s.clock().UnixMilli()}
 	return s.proposePut(cmd, 2*time.Second)
 }
 

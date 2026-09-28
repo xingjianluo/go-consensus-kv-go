@@ -35,6 +35,7 @@ func serveAdmin(raftAddr string, id raft.NodeID, node *raft.Node, store *kv.Stor
 	mux.HandleFunc("/session/open", st.sessionOpen)
 	mux.HandleFunc("/session/close", st.sessionClose)
 	mux.HandleFunc("/kv/put", st.kvPut)
+	mux.HandleFunc("/kv/batch", st.kvBatch)
 	mux.HandleFunc("/kv/get", st.kvGet)
 	mux.HandleFunc("/member/add", st.memberAdd)
 	mux.HandleFunc("/member/remove", st.memberRemove)
@@ -109,9 +110,68 @@ func (st *adminState) kvPut(w http.ResponseWriter, r *http.Request) {
 	res := st.svc.Put(req.Session, req.Request, req.Key, []byte(req.Value))
 	writeJSON(w, httpStatus(res), map[string]any{
 		"verdict": res.Verdict.String(), "reason": res.Reason,
-		"leader": res.Leader, "index": res.Index,
+		"leader": res.Leader, "index": res.Index, "version": res.Version,
 		"note": timeoutNote(res),
 	})
+}
+
+// kvBatch applies an atomic multi-key write. Request body:
+//
+//	{
+//	  "session": "s-...", "request": "req-42",
+//	  "items": [
+//	    {"key":"a","value":"1","check_version":true,"expected_version":0},
+//	    {"key":"b","value":"2"}
+//	  ]
+//	}
+//
+// A successful reply includes the commit index and per-key resulting
+// versions; a structural rejection / precondition failure is definitive
+// (HTTP 409), a timeout is 504 and MUST be retried with the same request.
+func (st *adminState) kvBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session string `json:"session"`
+		Request string `json:"request"`
+		Items   []struct {
+			Key             string `json:"key"`
+			Value           string `json:"value"`
+			CheckVersion    bool   `json:"check_version"`
+			ExpectedVersion int64  `json:"expected_version"`
+		} `json:"items"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"verdict": kv.VerdictRejected.String(), "reason": "bad-json",
+		})
+		return
+	}
+	items := make([]kv.BatchItem, len(req.Items))
+	for i, it := range req.Items {
+		items[i] = kv.BatchItem{Key: it.Key, Value: []byte(it.Value),
+			CheckVersion: it.CheckVersion, ExpectedVersion: it.ExpectedVersion}
+	}
+	res := st.svc.Batch(req.Session, req.Request, items)
+	out := map[string]any{
+		"verdict": res.Verdict.String(), "reason": res.Reason,
+		"leader": res.Leader, "index": res.Index,
+		"note": timeoutNote(res),
+	}
+	if len(res.Items) > 0 {
+		type ko struct {
+			Key     string `json:"key"`
+			Verdict string `json:"verdict"`
+			Reason  string `json:"reason,omitempty"`
+			Version int64  `json:"version"`
+		}
+		outs := make([]ko, len(res.Items))
+		for i, o := range res.Items {
+			outs[i] = ko{Key: o.Key, Verdict: o.Verdict.String(),
+				Reason: o.Reason, Version: o.Version}
+		}
+		out["items"] = outs
+	}
+	writeJSON(w, httpStatus(res), out)
 }
 
 func (st *adminState) kvGet(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +185,7 @@ func (st *adminState) kvGet(w http.ResponseWriter, r *http.Request) {
 	res := st.svc.Get(req.Session, req.Request, req.Key)
 	out := map[string]any{
 		"verdict": res.Verdict.String(), "reason": res.Reason,
-		"leader": res.Leader, "index": res.Index,
+		"leader": res.Leader, "index": res.Index, "version": res.Version,
 	}
 	if len(res.Value) > 0 {
 		out["value"] = string(res.Value)

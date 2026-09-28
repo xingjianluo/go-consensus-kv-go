@@ -106,6 +106,149 @@ func req(i int) string {
 	return "req-" + string(rune('a'+i))
 }
 
+func TestBatchServiceAtomicWrite(t *testing.T) {
+	svc, _, _ := newSingle(t)
+	sessionID, _ := svc.OpenSession(0)
+
+	res := svc.Batch(sessionID, "b1", []kv.BatchItem{
+		{Key: "a", Value: []byte("1")},
+		{Key: "b", Value: []byte("2"), CheckVersion: true, ExpectedVersion: 0},
+	})
+	if res.Verdict != kv.VerdictOK {
+		t.Fatalf("batch: %s %s", res.Verdict, res.Reason)
+	}
+	if len(res.Items) != 2 || res.Items[0].Version != 1 || res.Items[1].Version != 1 {
+		t.Fatalf("items=%+v", res.Items)
+	}
+	if r := svc.Get(sessionID, "g1", "a"); string(r.Value) != "1" || r.Version != 1 {
+		t.Fatalf("get a=%q ver=%d", r.Value, r.Version)
+	}
+
+	// Precondition failure: whole batch rejected, c must not appear.
+	res2 := svc.Batch(sessionID, "b2", []kv.BatchItem{
+		{Key: "c", Value: []byte("3")},
+		{Key: "a", Value: []byte("9"), CheckVersion: true, ExpectedVersion: 99},
+	})
+	if res2.Verdict != kv.VerdictPreconditionFailed || res2.Reason != "version-mismatch:a" {
+		t.Fatalf("res2=%s/%s", res2.Verdict, res2.Reason)
+	}
+	if r := svc.Get(sessionID, "g2", "c"); r.Verdict != kv.VerdictNotFound {
+		t.Fatalf("half batch visible: c verdict=%s", r.Verdict)
+	}
+
+	// Duplicate request id returns the ORIGINAL verdict and index even
+	// though state has moved.
+	origIndex := res.Index
+	later := svc.Put(sessionID, "p1", "a", []byte("later"))
+	if later.Verdict != kv.VerdictOK {
+		t.Fatalf("intervening put: %s", later.Verdict)
+	}
+	dup := svc.Batch(sessionID, "b1", []kv.BatchItem{
+		{Key: "a", Value: []byte("1")},
+		{Key: "b", Value: []byte("2"), CheckVersion: true, ExpectedVersion: 0},
+	})
+	if dup.Verdict != kv.VerdictDuplicate || dup.Index != origIndex {
+		t.Fatalf("dup verdict=%s index=%d want duplicate@%d",
+			dup.Verdict, dup.Index, origIndex)
+	}
+	if len(dup.Items) != 2 || dup.Items[1].Version != 1 {
+		t.Fatalf("dup items=%+v", dup.Items)
+	}
+}
+
+// TestBatchConcurrentCASRace fires two conditional updates based on the
+// same observed version; exactly one may win, the loser gets a
+// definitive precondition-failed verdict (not timeout/unknown).
+func TestBatchConcurrentCASRace(t *testing.T) {
+	svc, _, _ := newSingle(t)
+	sessionID, _ := svc.OpenSession(0)
+	seed := svc.Batch(sessionID, "seed", []kv.BatchItem{{Key: "cfg", Value: []byte("v0")}})
+	if seed.Verdict != kv.VerdictOK {
+		t.Fatal(seed.Verdict, seed.Reason)
+	}
+
+	const N = 8
+	var wg sync.WaitGroup
+	results := make([]kv.Result, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = svc.Batch(sessionID, "cas-"+req(i), []kv.BatchItem{{
+				Key: "cfg", Value: []byte("winner-or-loser"),
+				CheckVersion: true, ExpectedVersion: 1,
+			}})
+		}(i)
+	}
+	wg.Wait()
+
+	wins, losses := 0, 0
+	for i, r := range results {
+		switch r.Verdict {
+		case kv.VerdictOK:
+			wins++
+			if r.Items[0].Version != 2 {
+				t.Fatalf("winner %d version=%d want 2", i, r.Items[0].Version)
+			}
+		case kv.VerdictPreconditionFailed:
+			losses++
+			if r.Reason != "version-mismatch:cfg" || r.Items[0].Version != 2 {
+				t.Fatalf("loser %d reason=%s observed=%d", i, r.Reason, r.Items[0].Version)
+			}
+		default:
+			t.Fatalf("client %d unexpected %s/%s", i, r.Verdict, r.Reason)
+		}
+	}
+	if wins != 1 || losses != N-1 {
+		t.Fatalf("wins=%d losses=%d want 1/%d", wins, losses, N-1)
+	}
+	final := svc.Get(sessionID, "gf", "cfg")
+	if final.Version != 2 || string(final.Value) != "winner-or-loser" {
+		t.Fatalf("final ver=%d val=%q", final.Version, final.Value)
+	}
+}
+
+// TestBatchConcurrentSameRequestCoalesces: concurrent duplicates of one
+// batch request all receive the same original verdict and the batch's
+// writes apply exactly once (versions prove it).
+func TestBatchConcurrentSameRequestCoalesces(t *testing.T) {
+	svc, _, _ := newSingle(t)
+	sessionID, _ := svc.OpenSession(0)
+	const N = 12
+	items := []kv.BatchItem{{Key: "z", Value: []byte("1"),
+		CheckVersion: true, ExpectedVersion: 0}}
+	var wg sync.WaitGroup
+	results := make([]kv.Result, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = svc.Batch(sessionID, "same-batch", items)
+		}(i)
+	}
+	wg.Wait()
+	oks, dups := 0, 0
+	for _, r := range results {
+		switch r.Verdict {
+		case kv.VerdictOK:
+			oks++
+		case kv.VerdictDuplicate:
+			dups++
+		default:
+			t.Fatalf("unexpected %s/%s", r.Verdict, r.Reason)
+		}
+		if r.Index == 0 {
+			t.Fatal("missing commit index")
+		}
+	}
+	if oks+dups != N {
+		t.Fatalf("oks=%d dups=%d", oks, dups)
+	}
+	if r := svc.Get(sessionID, "gz", "z"); r.Version != 1 {
+		t.Fatalf("z applied more than once: version=%d", r.Version)
+	}
+}
+
 func TestExpiredReadRejected(t *testing.T) {
 	var svc *kv.Service
 	svc, _, _ = newSingle(t)

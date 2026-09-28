@@ -9,6 +9,9 @@
 //	go run ./cmd/client -servers 127.0.0.1:10101,127.0.0.1:10102,127.0.0.1:10103 session-open
 //	go run ./cmd/client -servers ... put <session> <req-id> <key> <value>
 //	go run ./cmd/client -servers ... get <session> <req-id> <key>
+//	# atomic batch: item syntax key=value, optional "@<expected-version>";
+//	# "@0" means the key must not exist yet
+//	go run ./cmd/client -servers ... batch <session> <req-id> a=1@0 b=2@3
 //	go run ./cmd/client -servers ... member-add <id> <raft-addr>
 //	go run ./cmd/client -servers ... member-remove <id>
 //	status
@@ -22,6 +25,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,7 +35,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: client <status|session-open|put|get|member-add|member-remove> ...")
+		fmt.Fprintln(os.Stderr, "usage: client <status|session-open|put|batch|get|member-add|member-remove> ...")
 		os.Exit(2)
 	}
 	cl := &client{
@@ -49,6 +54,9 @@ func main() {
 	case "get":
 		require(args, 4, "get <session> <req-id> <key>")
 		err = cl.get(args[1], args[2], args[3])
+	case "batch":
+		require(args, 4, "batch <session> <req-id> <key=value[@ver]> ...")
+		err = cl.batch(args[1], args[2], args[3:])
 	case "member-add":
 		require(args, 3, "member-add <id> <raft-addr>")
 		err = cl.memberAdd(args[1], args[2])
@@ -171,6 +179,45 @@ func (c *client) put(session, req, key, value string) error {
 func (c *client) get(session, req, key string) error {
 	m, err := c.do("/kv/get", map[string]string{
 		"session": session, "request": req, "key": key,
+	})
+	return c.print(m, err)
+}
+
+// batch sends one atomic multi-key write. Each spec has the form
+// key=value[@expected-version]; a trailing "@<int>" sets a precondition
+// ("@0" = key must not exist). A spec without "@" is unconditional.
+func (c *client) batch(session, req string, specs []string) error {
+	type item struct {
+		Key             string `json:"key"`
+		Value           string `json:"value"`
+		CheckVersion    bool   `json:"check_version"`
+		ExpectedVersion int64  `json:"expected_version"`
+	}
+	items := make([]item, 0, len(specs))
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		eq := strings.IndexByte(spec, '=')
+		if eq <= 0 {
+			return fmt.Errorf("bad item %q: want key=value[@ver]", spec)
+		}
+		key, rest := spec[:eq], spec[eq+1:]
+		value := rest
+		var check bool
+		var ver int64
+		if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+			if n, err := strconv.ParseInt(rest[at+1:], 10, 64); err == nil {
+				value, check, ver = rest[:at], true, n
+			}
+		}
+		if seen[key] {
+			return fmt.Errorf("duplicate key %q in one batch", key)
+		}
+		seen[key] = true
+		items = append(items, item{Key: key, Value: value,
+			CheckVersion: check, ExpectedVersion: ver})
+	}
+	m, err := c.do("/kv/batch", map[string]any{
+		"session": session, "request": req, "items": items,
 	})
 	return c.print(m, err)
 }
