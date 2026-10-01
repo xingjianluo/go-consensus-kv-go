@@ -17,6 +17,16 @@ go test ./...           # 确定性模拟测试（秒级，可重复）
 go test -race ./...     # 含竞态检测
 ```
 
+换主/恢复后重试收敛的稳定性可以本地大量重跑验证：
+
+```
+# 确定性 sim（手动时钟，极快，适合 -count 大量重跑）
+go test ./internal/sim/ -run 'BatchRetry|RepeatedSameRequest|ConditionalFailureRetry' -count=200 -v
+# 真实 3 节点 kv.Service（墙上时钟 + 故障注入网络），覆盖并发同号重试
+go test ./internal/kv/ -run 'RetryAfter|ConcurrentSameRequest' -count=50 -v
+go test -race ./internal/kv/ -run 'RetryAfter|ConcurrentSameRequest' -count=10
+```
+
 跑真实多进程集群与客户端见 [`docs/design.md`](docs/design.md#5-本地验证)。
 
 ## 结论约定
@@ -25,6 +35,16 @@ go test -race ./...     # 含竞态检测
   须用相同 `(session, request)` 重试。
 - 同一 `(session, request)` 恰好应用一次；重复得到 `duplicate` 与原始结论。
 - 少数派不能提交、不能返回成功；旧任期节点不能覆盖已提交数据。
+- **分区恢复 / 换主后的重试收敛**：用同一请求编号重发时，要么拿到第一次已提交的
+  原始结论（`duplicate`，带原始提交位置），要么作为一次全新的干净提交生效（`ok`）。
+  两种结论都唯一确定；在途合并、刚提交后的重复提案不会被当成"处理中/未知"返回，
+  也不会让调用方干等。同一请求编号多路并发重试（跨越换主/恢复前后）的每个调用方
+  都拿到**同一个确定结论、同一提交位置**；某个调用方超时只摘除它自己的等待，不
+  影响其它共享该提案的调用方。
+- 重试期间只有两种情况仍只能当"未知"：（1）本次调用在确认窗口内超时
+  （`timeout-unknown`，条目可能已提交，继续用同一编号重试即可收敛）；
+  （2）当时联系不到法定人数 leader（`not-leader`，重定向后重试）。
+  会话本身未知/关闭的 `session-expired` 是终态拒绝，不属此类。
 - 每条拒绝/丢弃都有可区分原因（`not-leader / term-stale / log-conflict /
   not-a-voter / dropped-partition / dropped-node-down ...`）。
 

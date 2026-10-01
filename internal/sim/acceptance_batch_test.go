@@ -178,25 +178,29 @@ func TestBatchRetryAfterPartitionConverges(t *testing.T) {
 		}
 	}
 
-	// Heal; wait for a stable leader (old leader may be deposed).
+	// Heal; wait for a leader. The deposed isolated node may briefly still
+	// report itself leader in an old term, so retry across leader changes
+	// (a term-stale proposal simply yields a later election) until the
+	// same-request retry yields a committed verdict, like a real client.
 	k.c.Network().Heal()
-	oldTerm := k.c.Node(leader).Term()
-	if !k.c.RunUntil(60, func(c *sim.Cluster) bool {
-		l := c.Leader()
-		// Settle means a leader CONFIRMED IN A NEWER TERM: the old
-		// isolated leader may still locally believe it leads at the old
-		// term, and a proposal to it would be term-stale.
-		return l != "" && l != leader && c.Node(l).Term() > oldTerm
-	}) {
-		t.Fatal("cluster did not settle under a new-term leader after heal")
+	var (
+		newLeader raft.NodeID
+		idx       raft.Index
+		converged bool
+	)
+	for attempt := 0; attempt < 40; attempt++ {
+		if !k.c.RunUntil(30, func(c *sim.Cluster) bool { return c.Leader() != "" }) {
+			continue
+		}
+		newLeader = k.c.Leader()
+		if i, ok := k.proposeCommittedOrCached(newLeader, cmd, "s", "partitioned"); ok {
+			idx, converged = i, true
+			break
+		}
+		k.tick(2)
 	}
-	newLeader := k.c.Leader()
-	// Retry the SAME request id on the settled leader. If the old entry
-	// somehow committed during healing the reply cache returns it; either
-	// way the retry produces exactly one decisive application.
-	idx, committed := k.propose(newLeader, cmd)
-	if !committed {
-		t.Fatal("retried batch did not commit after heal")
+	if !converged {
+		t.Fatal("retried batch did not converge to a committed verdict after heal")
 	}
 	k.tick(5)
 	k.assertConverged(ids("n1", "n2", "n3"))
@@ -255,5 +259,139 @@ func TestBatchLeaderCrashRestartKeepsVerdict(t *testing.T) {
 	))
 	if next.Verdict != kv.VerdictOK || next.Batch.Ops[0].Version != 2 {
 		t.Fatalf("conditional write after restart: %+v", next)
+	}
+}
+
+// Deterministic counterpart of the service-level retry tests: while the
+// leader is in a minority partition, repeated proposals with the SAME
+// request id (fresh Propose calls, as real clients do) never advance the
+// commit point on ANY node; after healing, every retry converges to the
+// single committed verdict at one position.
+func TestBatchRepeatedSameRequestDuringPartitionNeverCommits(t *testing.T) {
+	k := newKVCluster(t, []string{"n1", "n2", "n3"}, 0)
+	leader := k.waitLeader(40)
+	k.propose(leader, kv.Command{Type: kv.CmdSessionOpen, SessionID: "s",
+		RequestID: "open", CreateTime: 1})
+
+	cmd := batchCmd("s", "storm",
+		kv.BatchOp{Key: "q1", Value: []byte("a")},
+		kv.BatchOp{Key: "q2", Value: []byte("b")},
+	)
+	data, _ := kv.Encode(cmd)
+	rid := raft.ReqID("s/storm")
+
+	k.c.Network().Isolate(leader, ids("n1", "n2", "n3"))
+	// The isolated leader must not advance its own commit point. The
+	// majority side may legally elect a new leader and commit its own
+	// term no-ops, but it cannot contain the batch's entries, so assert
+	// the batch itself is absent there (no cache, no keys) rather than
+	// claiming the commit index can never move.
+	leaderMark := k.c.Node(leader).CommitIndex()
+	// Many same-id retries while isolated: none may commit anywhere.
+	for i := 0; i < 12; i++ {
+		k.c.Node(leader).Propose(rid, data)
+		k.tick(2)
+	}
+	if got := k.c.Node(leader).CommitIndex(); got != leaderMark {
+		t.Fatalf("isolated leader advanced commit %d -> %d", leaderMark, got)
+	}
+	for _, id := range ids("n1", "n2", "n3") {
+		if _, ok := k.stores[id].PendingPut("s", "storm"); ok {
+			t.Fatalf("%s cached verdict for an uncommitted partitioned batch", id)
+		}
+		for _, key := range [2]string{"q1", "q2"} {
+			if r := k.stores[id].Read("s", key, 1); r.Verdict != kv.VerdictNotFound {
+				t.Fatalf("%s saw partitioned key %s", id, key)
+			}
+		}
+	}
+
+	// Heal; settle on a quorum-valid leader; same-id retry converges once.
+	// Right after heal, Leader() may briefly still name the deposed
+	// isolated node (term-stale proposals); retry across leader changes
+	// until a committed verdict appears, as a real client would.
+	k.c.Network().Heal()
+	var (
+		nl        raft.NodeID
+		idx       raft.Index
+		converged bool
+	)
+	for attempt := 0; attempt < 30; attempt++ {
+		if !k.c.RunUntil(30, func(c *sim.Cluster) bool { return c.Leader() != "" }) {
+			continue
+		}
+		nl = k.c.Leader()
+		if i, ok := k.proposeCommittedOrCached(nl, cmd, "s", "storm"); ok {
+			idx, converged = i, true
+			break
+		}
+		k.tick(2)
+	}
+	if !converged {
+		t.Fatal("retry after heal did not converge to a committed verdict")
+	}
+	// Several more same-id retries: the raft layer answers
+	// already-committed duplicate without a second entry; every node's
+	// cache keeps the single original verdict.
+	for i := 0; i < 5; i++ {
+		k.c.Node(nl).Propose(rid, data)
+		k.tick(2)
+	}
+	k.tick(5)
+	k.assertConverged(ids("n1", "n2", "n3"))
+	for _, id := range ids("n1", "n2", "n3") {
+		rep, ok := k.stores[id].PendingPut("s", "storm")
+		if !ok || rep.Verdict != kv.VerdictOK || rep.AppliedAt != idx {
+			t.Fatalf("%s cache: ok=%v %+v want ok @%d", id, ok, rep, idx)
+		}
+		for _, key := range [2]string{"q1", "q2"} {
+			r := k.stores[id].Read("s", key, 1)
+			if r.Verdict != kv.VerdictOK || r.Version != 1 {
+				t.Fatalf("%s %s = %q v%d want v1", id, key, r.Value, r.Version)
+			}
+		}
+	}
+}
+
+// A conditional batch whose precondition failed, replayed with the same
+// request id AFTER other writes moved the version (and after a leadership
+// cycle), returns the ORIGINAL failure with the ORIGINAL actual version —
+// it never re-evaluates against the newest state.
+func TestBatchConditionalFailureRetryKeepsOriginalDetail(t *testing.T) {
+	k := newKVCluster(t, []string{"n1", "n2", "n3"}, 0)
+	leader := k.waitLeader(40)
+	k.propose(leader, kv.Command{Type: kv.CmdSessionOpen, SessionID: "s",
+		RequestID: "open", CreateTime: 1})
+	idx, committed := k.propose(leader, batchCmd("s", "failx",
+		kv.BatchOp{Key: "k", Value: []byte("new"), ExpectVersion: kv.ExpectVersion(5)},
+	))
+	if !committed {
+		t.Fatal("failing batch must still commit as a log entry")
+	}
+	k.tick(3)
+	// Move the key to version 1.
+	k.propose(leader, batchCmd("s", "other",
+		kv.BatchOp{Key: "k", Value: []byte("actual")},
+	))
+	k.tick(3)
+
+	// Replay the failed request at a later index (model of a retry): must
+	// be a duplicate carrying the original failure at the original index,
+	// with actual_version 0 (key absent at first evaluation), not 1.
+	retry := mustBatch(t, k.stores[leader], idx+50, batchCmd("s", "failx",
+		kv.BatchOp{Key: "k", Value: []byte("new"), ExpectVersion: kv.ExpectVersion(5)},
+	))
+	if retry.Verdict != kv.VerdictDuplicate {
+		t.Fatalf("retry verdict=%s want duplicate", retry.Verdict)
+	}
+	b := retry.Batch
+	if b.AppliedAt != idx || b.FailedKey != "k" ||
+		b.ExpectVersion != 5 || b.ActualVersion != 0 {
+		t.Fatalf("retry lost original failure detail: %+v", b)
+	}
+	// And the key keeps its only successful write at version 1.
+	r := k.stores[leader].Read("s", "k", 1)
+	if string(r.Value) != "actual" || r.Version != 1 {
+		t.Fatalf("retry of failed batch mutated state: %q v%d", r.Value, r.Version)
 	}
 }

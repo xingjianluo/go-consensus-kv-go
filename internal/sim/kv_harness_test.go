@@ -108,6 +108,39 @@ func (k *kvCluster) leaderCommit(id raft.NodeID) raft.Index {
 	return k.c.Node(id).CommitIndex()
 }
 
+// proposeCommittedOrCached is like propose but also accepts the
+// PropCommitted/RejectDuplicate answer (the retry's original entry
+// already committed), resolving its position from the reply cache. This
+// models a client whose first attempt timed out unknown but whose entry
+// committed before the retry.
+func (k *kvCluster) proposeCommittedOrCached(leader raft.NodeID, cmd kv.Command,
+	sessionID, requestID string) (raft.Index, bool) {
+	data, err := kv.Encode(cmd)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	rid := raft.ReqID(cmd.SessionID + "/" + cmd.RequestID)
+	startEvents := len(k.c.Events())
+	k.c.Node(leader).Propose(rid, data)
+	ok := k.c.RunUntil(40, func(c *sim.Cluster) bool {
+		for _, e := range c.Events()[startEvents:] {
+			if e.Node != leader || e.Type != raft.EvtProposalResult || e.ReqID != rid {
+				continue
+			}
+			if e.Status == raft.PropCommitted {
+				return true
+			}
+		}
+		return false
+	})
+	if ok {
+		if rep, ok := k.stores[leader].PendingPut(sessionID, requestID); ok {
+			return rep.AppliedAt, true
+		}
+	}
+	return 0, false
+}
+
 // assertConverged asserts every live member's KV store is identical.
 func (k *kvCluster) assertConverged(live []raft.NodeID) {
 	snap0 := mustSnapshot(k.t, k.stores[live[0]])

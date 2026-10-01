@@ -48,8 +48,23 @@
   - 同一请求重复提交（含崩溃后重放日志）只会应用一次，重复得到
     `VerdictDuplicate` 并返回**原始结论与原始 index**。
   - 同一进程内并发重复请求共享同一个在途提案（原子 join-or-register）。
+- **并发同号重试的等待者管理（service 层）**：
+  - 同一 `(session, request)` 的多个调用方挂在同一个 pending 上，提案到达终态
+    （提交关联 / 显式拒绝）时一次性向所有等待者投递**同一个**结论。
+  - 某个调用方自己的确认窗口超时，**只摘除它自己那一个等待者**；pending 与
+    其它等待者保留——后提交成功时其余调用方照常拿到确定结论，不会被一个超时
+    者"连坐"成未知。最后一个等待者离开后 pending 才删除，之后的重发才会发新
+    提案（raft 与 reply cache 保证仍只生效一次）。
+  - raft 对"原条目**已提交后**的重复 propose"会回 `PropCommitted +
+    RejectDuplicate` 事件；service 据此从 reply cache 取出原始结论投递给等待者，
+    而不是把它当作"处理中"丢弃、让调用方等到超时。若该事件先于本节点应用条目的
+    Ready 批次到达（事件是在 raft 锁内同步发出的，而应用在另一条通路上），事件
+    会被暂存并在每个 Ready 批次应用后重试，直到能从缓存读到原始结论。
 - 会话有空闲 TTL：过期/已关闭会话的读、写都被**显式拒绝**
   （`session-expired`，并带 `no-such-session/closed/idle-ttl` 原因）。
+  注意服务层对"本节点 store 还没追上会话条目"会先快速回
+  `session-expired/session-unknown-or-closed`：这在新当选 leader 刚追平时是
+  **可重试**响应，客户端用同一编号重试即可，不代表会话终态失效。
 - **超时不等于成功**：写在限定时间内未拿到多数确认时返回
   `timeout-unknown`，调用方不得据此认为已提交；可用相同
   `(sessionID, requestID)` 重试，由 reply cache 收敛到真实结论。
@@ -88,10 +103,27 @@
 - **与单键能力的兼容**：单键 `put/get` 的报文、结论与 TTL 语义不变，只是
   响应额外带 `version`（读也带当前版本）；版本表是快照中的附加字段，旧
   快照恢复时按现存键补版本 1。
-- **超时/领导者切换下的重试**：分区中的 leader 拿不到多数，批量不会提交
-  （`timeout-unknown`，结果未知）；恢复后用同一 request id 向新 leader
-  重发：若旧条目已随恢复提交则 reply cache 返回原结论，否则作为新条目
-  提交——两种情况都收敛到**唯一确定结论**，键只受这一次影响。
+- **分区恢复 / 换主后的同号重试如何收敛**：用同一个
+  `(sessionID, requestID)` 重发时，结论恰好是以下两者之一，且二者都唯一确定：
+  1. **返回第一次已提交的原始结论**：旧条目在恢复过程中（或任何时刻）已经被
+     多数提交——重发命中 reply cache（或 raft 的"已提交去重"快速通道），得到
+     `duplicate` 与原始 `applied_at`、每键原始版本、原始失败详情；
+  2. **作为一次全新的干净提交生效**：旧条目从未提交（少数派 leader 被换、
+     未提交后缀被新任期覆盖）——重发追加为新条目，得到一次 `ok`，相关键恰好
+     受这一次影响，版本只前进一次。
+
+  无论重试多少次、中途落到哪个节点，相关键的最终值/版本与提交位置都与这唯一
+  结论一致；前置条件**不会**按最新状态重新判断（条件失败的一方在任何重试下都
+  拿到同一份确定失败原因，不会和超时后的未知混淆）。
+- **什么时候仍然只能当成未知**：只有在"本次调用"层面拿不到终态时——
+  - `timeout-unknown`：确认窗口内未得到多数确认，条目可能已提交也可能没有；
+    继续用同一编号重试即按上面两种结果收敛；
+  - `not-leader`（含 `term-stale`、`not-a-voter`）：当前联系的节点给不了结论，
+    按返回的 leader 提示重定向后用同一编号重试。
+
+  这两者都**不会**被当成"已经完成"回给调用方；而一旦条目已提交，任何重试都
+  立即得到确定结论，调用方不会一直干等。在途合并的第二次调用会等待原提案的
+  终态（提交/拒绝），那个终态本身仍是上述确定结论之一。
 
 ---
 
@@ -110,7 +142,7 @@
 | `not-a-voter` | 非成员发起/回应，或已删除成员的迟到消息 | 安全忽略，不更新进度、不影响提交 |
 | `dropped-partition` | 注入的分区规则命中（投递时判定） | 消息未送达 |
 | `dropped-node-down` | 目标已崩溃（投递时判定） | 消息未送达 |
-| `duplicate` | 同请求在途合并 | 不重复应用，等待原提案结论 |
+| `duplicate` | 同请求重复：在途则合并等待原提案终态；已提交则回原始结论 | 不重复应用；两种情况调用方都拿到确定结论 |
 | `timeout-unknown` | 超时未确认 | 结果未知，**禁止当作已提交** |
 | `invalid-batch` | 批量结构非法（空批次/空键/重复键/超限） | 确定拒绝，无任何键生效；原因细分 |
 | `precondition-failed` | 某项期望版本与当前不符 | 确定拒绝，整体不生效；带 `failed_key` 与期望/实际版本 |
@@ -169,6 +201,18 @@ go test ./...
 go test -race ./...
 go test ./internal/sim/ -run TestPartitionCrashMembershipRestartCombined -v
 ```
+
+**重试收敛稳定性的反复验证**（本地连续大量重跑不应出现任何失败）：
+```
+# 确定性 sim：手动时钟，单轮毫秒级，适合几百次重跑
+go test ./internal/sim/ -run 'BatchRetry|RepeatedSameRequest|ConditionalFailureRetry' -count=200
+# 真实 3 节点 Service（墙上时钟 + 内存故障注入网络）：换主/恢复 + 并发同号重试
+go test ./internal/kv/ -run 'RetryAfter|ConcurrentSameRequest' -count=50
+go test -race ./internal/kv/ -run 'RetryAfter|ConcurrentSameRequest' -count=10
+```
+集成测试用短写超时（`SetWriteTimeout`，默认 2s）驱动，因此分区中每个"未知"
+响应只等约 0.1s；客户端循环按"未知/not-leader/leader 尚未追平会话→同号重试，
+其它结论→终态"推进，正是真实客户端的收敛姿势。
 模拟使用**手动推进的时钟**与按 `(到期时间, 入队序号)` 排序的确定性调度；相同
 输入重复运行得到相同的 leader 序列、任期与最终 index。测试日志会打印关键
 事件、任期、日志位置与判定依据（见各 `acceptance_*_test.go` 中的 `t.Logf`
@@ -190,8 +234,25 @@ go test ./internal/sim/ -run TestPartitionCrashMembershipRestartCombined -v
   - `TestBatchPreconditionFailureConvergesAllOrNothing`（条件失败全有或全无）
   - `TestBatchDuplicateAfterInterveningWrites`（重复请求返回原始结论）
   - `TestBatchRetryAfterPartitionConverges`（分区/领导切换后同 request 重试收敛）
+  - `TestBatchRepeatedSameRequestDuringPartitionNeverCommits`（分区内反复同号
+    重试绝不提交；恢复后跨换主重试收敛到唯一结论）
+  - `TestBatchConditionalFailureRetryKeepsOriginalDetail`（条件失败的同号重试
+    返回原始失败详情与原始 actual 版本，不按新状态重判）
   - `TestBatchLeaderCrashRestartKeepsVerdict`（崩溃重启后结论与版本保留）
   - `TestBatchConcurrentConditionalRace`（并发条件更新恰一个成功，失败可区分）
+  - 真实 3 节点 `kv.Service` + 故障注入网络的重试收敛套件
+    （`internal/kv/retry_convergence_test.go`，墙上时钟、`-count` 可大量重跑）：
+    - `TestRetryAfterPartitionConvergesToOneCommit`（分区未知→恢复后同号重试
+      收敛到原始结论或一次干净提交，后续重试恒为同一 index 的 duplicate）
+    - `TestRetryAfterLeaderChangeReturnsOriginalVerdict`（条目已提交后换主，
+      同号条件批重试返回原始结论，不按新版本重判、不重复生效）
+    - `TestRetriedConditionalFailureKeepsOriginalReason`（条件失败重试恒返回
+      同一份确定原因，不与 timeout-unknown 混淆）
+    - `TestConcurrentSameRequestRetriesAllDecisive`（分区/恢复/换主前后多路
+      并发同号重试，每个调用方拿到同一确定结论与同一提交位置，无人拿到未知、
+      无人干等）
+    - `TestConcurrentSameRequestNoFaultStress`（无故障同任期高并发同号请求，
+      专门压"刚提交后的重复提案"快速通道）
   - `TestBatchStructuralValidation`（重复键/空键/超限）/
     `TestBatchCreateIfAbsent` / `TestBatchSnapshotRestorePreservesVersionsAndReplies`
 - `TestPartitionCrashMembershipRestartCombined`（分区+崩溃+重启+成员变更）

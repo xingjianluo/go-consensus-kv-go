@@ -44,6 +44,13 @@ type Service struct {
 	others map[raft.ReqID]*pending
 	reads  map[raft.ReqID]chan Result
 
+	writeTimeout time.Duration
+
+	// Committed-duplicate notifications whose entry has not been applied
+	// on this node yet. They are retried after every Ready batch, so the
+	// original verdict is read from the reply cache rather than guessed.
+	deferCommitted []raft.Event
+
 	events chan raft.Event
 	stop   chan struct{}
 
@@ -57,14 +64,15 @@ type Service struct {
 // NewService constructs a Service.
 func NewService(n *raft.Node, st *Store) *Service {
 	s := &Service{
-		node:   n,
-		store:  st,
-		clock:  time.Now,
-		puts:   map[string]map[string]*pending{},
-		others: map[raft.ReqID]*pending{},
-		reads:  map[raft.ReqID]chan Result{},
-		events: make(chan raft.Event, 256),
-		stop:   make(chan struct{}),
+		node:         n,
+		store:        st,
+		clock:        time.Now,
+		puts:         map[string]map[string]*pending{},
+		others:       map[raft.ReqID]*pending{},
+		reads:        map[raft.ReqID]chan Result{},
+		writeTimeout: 2 * time.Second,
+		events:       make(chan raft.Event, 256),
+		stop:         make(chan struct{}),
 	}
 	// Auto-register so callers do not have to thread the sink through
 	// raft.Options (which would preclude other observers such as logs).
@@ -84,6 +92,15 @@ func (s *Service) EventSink() func(raft.Event) {
 
 // SetClock overrides the wall clock (deterministic tests).
 func (s *Service) SetClock(f func() time.Time) { s.clock = f }
+
+// SetWriteTimeout overrides how long a write waits for commit confirmation
+// before answering timeout-unknown. Default is 2s. Tests use a short value
+// so partitioned-proposal retries do not burn wall time.
+func (s *Service) SetWriteTimeout(d time.Duration) {
+	if d > 0 {
+		s.writeTimeout = d
+	}
+}
 
 func newSessionID() string {
 	b := make([]byte, 12)
@@ -119,6 +136,7 @@ func (s *Service) handleReady(r raft.Ready) {
 			return
 		}
 		s.node.Applied(r.Snapshot.Index)
+		s.retryDeferred()
 		return
 	}
 	var last raft.Index
@@ -137,6 +155,26 @@ func (s *Service) handleReady(r raft.Ready) {
 	if last > 0 {
 		s.node.Applied(last)
 	}
+	// Entries applied (possibly more batches emitted re-entrantly by
+	// Applied): any deferred committed-duplicate can now hit the cache.
+	s.retryDeferred()
+}
+
+// retryDeferred replays "your proposal is already committed" duplicate
+// notifications that arrived before this node applied the carrying entry.
+// Events whose waiter is gone, or whose entry still has not arrived, are
+// dropped or kept respectively; nothing waits on an event forever.
+func (s *Service) retryDeferred() {
+	if len(s.deferCommitted) == 0 {
+		return
+	}
+	pending := s.deferCommitted[:0]
+	for _, e := range s.deferCommitted {
+		if !s.deliverCommittedDuplicate(e) {
+			pending = append(pending, e)
+		}
+	}
+	s.deferCommitted = pending
 }
 
 // correlate matches a committed entry back to its waiter and returns
@@ -169,19 +207,35 @@ func (s *Service) correlate(e raft.Entry, res Result) {
 }
 
 func (s *Service) handleEvent(e raft.Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	switch e.Type {
 	case raft.EvtProposalResult:
+		if e.Status == raft.PropCommitted && e.Reason == raft.RejectDuplicate {
+			// A repeated proposal whose ORIGINAL entry already committed in
+			// this term. This is decisive: hand over the cached original
+			// verdict; never answer "processing" or "unknown".
+			if s.deliverCommittedDuplicate(e) {
+				return
+			}
+			// The carrying entry has not been applied on THIS node yet
+			// (event delivered ahead of its Ready batch). Remember it and
+			// retry from retryDeferred once the entry lands.
+			s.mu.Lock()
+			s.deferCommitted = append(s.deferCommitted, e)
+			s.mu.Unlock()
+			return
+		}
 		if e.Status == raft.PropCommitted {
-			return // resolved via committed-entry correlation
+			return // first proposal: resolved via committed-entry correlation
 		}
 		if e.Reason == raft.RejectDuplicate {
-			// In-flight coalescing: the shared proposal's terminal result
-			// arrives via committed-entry correlation; keep waiting.
+			// In-flight coalescing onto an UNCOMMITTED proposal: the shared
+			// pending's terminal result arrives via committed-entry
+			// correlation or a rejection on term change; keep waiting.
 			return
 		}
 		// Explicit rejection (not leader / stale term / not a voter).
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if p := s.others[e.ReqID]; p != nil {
 			p.deliver(Result{Verdict: VerdictNotLeader, Leader: e.Leader,
 				Reason: e.Reason.String(), Index: e.Index})
@@ -193,12 +247,14 @@ func (s *Service) handleEvent(e raft.Event) {
 			for rid, p := range m {
 				if raft.ReqID(sid+"/"+rid) == e.ReqID {
 					p.deliver(Result{Verdict: VerdictNotLeader, Leader: e.Leader,
-						Reason: e.Reason.String()})
+						Reason: e.Reason.String(), Index: e.Index})
 					delete(m, rid)
 				}
 			}
 		}
 	case raft.EvtReadResult:
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if ch := s.reads[e.ReqID]; ch != nil {
 			v := VerdictOK
 			reason := ""
@@ -212,10 +268,62 @@ func (s *Service) handleEvent(e raft.Event) {
 	}
 }
 
+// deliverCommittedDuplicate answers every waiter of a write whose first
+// proposal already committed, using the ORIGINAL verdict recorded in the
+// state machine reply cache. It returns false (changing nothing) when the
+// entry is not applied locally yet or no waiter remains.
+func (s *Service) deliverCommittedDuplicate(e raft.Event) bool {
+	s.mu.Lock()
+	var target *pending
+	var sid, rid string
+	for s0, m := range s.puts {
+		for r0, p := range m {
+			if raft.ReqID(s0+"/"+r0) == e.ReqID {
+				target, sid, rid = p, s0, r0
+			}
+		}
+	}
+	s.mu.Unlock()
+	if target == nil {
+		// Nobody is waiting: nothing to defer; the fast path at the next
+		// public call serves the cached verdict directly.
+		return true
+	}
+	rep, ok := s.store.PendingPut(sid, rid)
+	if !ok {
+		return false // original entry not applied locally yet
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res := duplicateResultFromReply(rep)
+	res.Leader = s.node.Leader()
+	res.Index = rep.AppliedAt
+	if m := s.puts[sid]; m != nil {
+		if p := m[rid]; p != nil {
+			p.deliver(res)
+			delete(m, rid)
+		}
+	}
+	return true
+}
+
+// duplicateResultFromReply builds the caller-facing verdict for a retried
+// write that already committed: the same shape as the service fast path,
+// i.e. VerdictDuplicate carrying the first verdict's complete detail.
+func duplicateResultFromReply(rep Reply) Result {
+	return Result{
+		Verdict: VerdictDuplicate,
+		Reason:  "request-already-applied",
+		Value:   rep.Value,
+		Version: rep.Version,
+		Batch:   rep.Batch,
+	}
+}
+
 // proposeWrite submits a write (single put or atomic batch) with an
 // explicit timeout. Registration of the waiter is atomic so concurrent
 // duplicates share one proposal and all get the same terminal result.
-func (s *Service) proposeWrite(cmd Command, timeout time.Duration) Result {
+func (s *Service) proposeWrite(cmd Command) Result {
 	if s.node.Role() != raft.RoleLeader {
 		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
 			Reason: raft.RejectNotLeader.String()}
@@ -229,24 +337,46 @@ func (s *Service) proposeWrite(cmd Command, timeout time.Duration) Result {
 	select {
 	case res := <-ch:
 		return res
-	case <-time.After(timeout):
+	case <-time.After(s.writeTimeout):
 		// CRITICAL: timeout means "outcome unknown", never success. The
-		// entry may still commit; later duplicate requests reconcile via
-		// the state machine's per-request reply cache. Remove the pending
-		// registration so a retry can issue a fresh proposal.
-		s.forgetPut(cmd.SessionID, cmd.RequestID)
+		// entry may still commit; a later duplicate reconciles via the
+		// state machine's per-request reply cache. Detach ONLY THIS
+		// waiter: other concurrent callers sharing the proposal keep
+		// waiting for its (still possible) terminal result instead of
+		// being orphaned into unknown. The shared pending is dropped once
+		// its last waiter leaves.
+		s.detachPut(cmd.SessionID, cmd.RequestID, ch)
 		return Result{Verdict: VerdictTimeout, Reason: "commit-not-confirmed-in-time"}
 	case <-s.stop:
+		s.detachPut(cmd.SessionID, cmd.RequestID, ch)
 		return Result{Verdict: VerdictNotLeader, Reason: "closing"}
 	}
 }
 
-func (s *Service) forgetPut(sessionID, requestID string) {
+// detachPut removes one waiter channel from the shared pending. When it
+// was the last waiter the pending registration itself is removed, so a
+// later retry can register a fresh proposal.
+func (s *Service) detachPut(sessionID, requestID string, ch <-chan Result) {
 	s.mu.Lock()
-	if m := s.puts[sessionID]; m != nil {
+	defer s.mu.Unlock()
+	m := s.puts[sessionID]
+	if m == nil {
+		return
+	}
+	p := m[requestID]
+	if p == nil {
+		return
+	}
+	kept := p.waiters[:0]
+	for _, w := range p.waiters {
+		if w != ch {
+			kept = append(kept, w)
+		}
+	}
+	p.waiters = kept
+	if len(p.waiters) == 0 {
 		delete(m, requestID)
 	}
-	s.mu.Unlock()
 }
 
 // OpenSession creates a session and returns its id.
@@ -306,7 +436,7 @@ func (s *Service) Put(sessionID, requestID, key string, value []byte) Result {
 	}
 	cmd := Command{Type: CmdPut, SessionID: sessionID, RequestID: requestID,
 		Key: key, Value: value, CreateTime: s.clock().UnixMilli()}
-	return s.proposeWrite(cmd, 2*time.Second)
+	return s.proposeWrite(cmd)
 }
 
 // Batch proposes an atomic multi-key write. Each item may carry an
@@ -342,7 +472,7 @@ func (s *Service) Batch(sessionID, requestID string, items []BatchItem) Result {
 	}
 	cmd := Command{Type: CmdBatch, SessionID: sessionID, RequestID: requestID,
 		Ops: ops, CreateTime: s.clock().UnixMilli()}
-	return s.proposeWrite(cmd, 2*time.Second)
+	return s.proposeWrite(cmd)
 }
 
 // joinOrRegisterPut atomically joins an in-flight request or registers
