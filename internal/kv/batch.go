@@ -114,12 +114,19 @@ func validateBatch(cmd Command) string {
 // applyBatchLocked evaluates and (if every precondition holds) applies a
 // batch atomically. The caller must hold s.mu.
 //
-// Ordering mirrors CmdPut: session validity (and idle TTL) is checked
-// first, then the per-request reply cache. A repeated (session, request)
-// always returns the FIRST verdict, even when later writes have changed
-// the keys or the original request was rejected.
+// Ordering mirrors CmdPut: the per-request reply cache is consulted
+// BEFORE session liveness checks, so a retry of a request that already
+// has a verdict ALWAYS returns that FIRST verdict — even after the
+// session has gone idle/closed. A repeated (session, request) returns
+// the first verdict, even when later writes have changed the keys or
+// the original request was rejected.
 func (s *Store) applyBatchLocked(cmd Command, idx raft.Index) Result {
 	sess := s.sessions[cmd.SessionID]
+	if sess != nil {
+		if rep, ok := sess.Replies[cmd.RequestID]; ok {
+			return batchResultFromReply(rep)
+		}
+	}
 	if sess == nil {
 		return Result{Verdict: VerdictSessionExpired, Reason: "no-such-session", Index: idx}
 	}
@@ -130,9 +137,6 @@ func (s *Store) applyBatchLocked(cmd Command, idx raft.Index) Result {
 		cmd.CreateTime-sess.LastUsedMillis > sess.TTLMillis {
 		sess.Closed = true
 		return Result{Verdict: VerdictSessionExpired, Reason: "idle-ttl", Index: idx}
-	}
-	if rep, ok := sess.Replies[cmd.RequestID]; ok {
-		return batchResultFromReply(rep)
 	}
 
 	if reason := validateBatch(cmd); reason != "" {

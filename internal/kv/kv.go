@@ -186,6 +186,15 @@ func (s *Store) applyLocked(cmd Command, idx raft.Index) Result {
 		if sess == nil {
 			return Result{Verdict: VerdictSessionExpired, Reason: "no-such-session"}
 		}
+		// Idempotency takes precedence over session liveness: a retry of
+		// a request that already has a verdict returns the FIRST verdict
+		// even after idle expiry/close, so post-leadership-change retries
+		// never resolve to a brand-new session-expired verdict.
+		if rep, ok := sess.Replies[cmd.RequestID]; ok {
+			return Result{Verdict: VerdictDuplicate, Value: rep.Value,
+				Reason: "request-already-applied", Index: rep.AppliedAt,
+				Version: rep.Version}
+		}
 		if sess.Closed {
 			return Result{Verdict: VerdictSessionExpired, Reason: "closed"}
 		}
@@ -193,12 +202,6 @@ func (s *Store) applyLocked(cmd Command, idx raft.Index) Result {
 			cmd.CreateTime-sess.LastUsedMillis > sess.TTLMillis {
 			sess.Closed = true
 			return Result{Verdict: VerdictSessionExpired, Reason: "idle-ttl"}
-		}
-		// Idempotency: a repeated (session, request) returns first verdict.
-		if rep, ok := sess.Replies[cmd.RequestID]; ok {
-			return Result{Verdict: VerdictDuplicate, Value: rep.Value,
-				Reason: "request-already-applied", Index: rep.AppliedAt,
-				Version: rep.Version}
 		}
 		s.kv[cmd.Key] = append([]byte(nil), cmd.Value...)
 		next := s.versions[cmd.Key] + 1

@@ -48,11 +48,38 @@
   - 同一请求重复提交（含崩溃后重放日志）只会应用一次，重复得到
     `VerdictDuplicate` 并返回**原始结论与原始 index**。
   - 同一进程内并发重复请求共享同一个在途提案（原子 join-or-register）。
-- 会话有空闲 TTL：过期/已关闭会话的读、写都被**显式拒绝**
+  - reply cache 的查询**先于**会话关闭/空闲 TTL 判断：会话过期后，对
+    **已有结论**请求的重试仍返回原始结论；只有全新请求才收到
+    `session-expired`。否则换主后重试会得到一个"既非原始结论也非新提交"
+    的第三方结论，破坏收敛。
+- 会话有空闲 TTL：过期/已关闭会话的读、以及**全新**写请求都被显式拒绝
   （`session-expired`，并带 `no-such-session/closed/idle-ttl` 原因）。
 - **超时不等于成功**：写在限定时间内未拿到多数确认时返回
   `timeout-unknown`，调用方不得据此认为已提交；可用相同
   `(sessionID, requestID)` 重试，由 reply cache 收敛到真实结论。
+- **等待者合并与超时对账（service 层）**：同 `(session, request)` 的并发
+  调用方在 service 内共享同一个 pending 与同一个 raft 提案。某个调用方
+  超时只**摘除它自己的等待通道**，绝不删除整个 pending：
+  - 其余并发调用方在条目提交/被拒时照常收到同一个终态，不会因别人超时
+    而永久干等；
+  - 摘除后立即与 reply cache 对账：若条目其实已经提交/应用，则该调用方
+    也拿到**原始确定结论**（成功/结构非法/条件失败原样返回），而不是
+    `timeout-unknown`；只有确实尚无结论时才如实返回未知。
+  - raft 层对在途 `ReqID` 的重复提案做合并（`duplicate`，表示"已并到在途
+    提案，终态随后送达"），这只是**中间态**，service 永远不会把它当作
+    "已完成"回给调用方；终态只来自提交相关性或明确拒绝。
+- **换主 / 分区恢复后的收敛**：用同一请求编号重发只会落到两种确定结论：
+  1. 旧条目已（在旧 leader 或新 leader 处）提交 ⇒ reply cache 返回第一次
+     的原始结论；
+  2. 旧条目确认从未提交（少数派旧 leader 被换掉、旧任期条目被更高任期
+     覆盖）⇒ 重试在新任期作为**一条全新条目干净提交**。
+
+  `not-leader`（此刻没有可联系的 leader）与 `timeout-unknown`（自己的等待
+  窗口到期）都只是传输层瞬时状态，不代表成败；客户端跟随更高任期 leader
+  用同一编号继续重试，最终必为上述二者之一。集群在分区恢复瞬间可能短暂
+  存在两个自称 leader 的节点（被废 leader 尚未看到更高任期），因此选择
+  重试目标时以**最高任期**为准（`sim.Cluster.Leader()` 与客户端 leader
+  提示均按此确定性选取）。
 
 ### 1.5 原子批量写与条件更新
 批量请求（`CmdBatch`）是一条普通 raft 日志条目，因此天然继承单键写的
@@ -192,6 +219,14 @@ go test ./internal/sim/ -run TestPartitionCrashMembershipRestartCombined -v
   - `TestBatchRetryAfterPartitionConverges`（分区/领导切换后同 request 重试收敛）
   - `TestBatchLeaderCrashRestartKeepsVerdict`（崩溃重启后结论与版本保留）
   - `TestBatchConcurrentConditionalRace`（并发条件更新恰一个成功，失败可区分）
+  - `TestBatchRetryConvergenceAcrossPartitionAndLeaderChange`（**真实 service
+    goroutine + 三节点**：分区中提案悬空→恢复/换主后同编号重试收敛；同一
+    编号 12 路并发跨越分区边界，每个调用方都拿到同一确定结论与同一提交
+    位置；条件失败方拿到确定原因。内置多轮迭代，可用
+    `KVBATCH_RETRY_ITERS` 调次数）
+  - `TestRetryAfterSessionExpiryReturnsOriginalVerdict` /
+    `TestDecisiveResultFromReplyPreservesOriginal`（会话过期后重试仍返回
+    原始结论；超时对账保留原始判定）
   - `TestBatchStructuralValidation`（重复键/空键/超限）/
     `TestBatchCreateIfAbsent` / `TestBatchSnapshotRestorePreservesVersionsAndReplies`
 - `TestPartitionCrashMembershipRestartCombined`（分区+崩溃+重启+成员变更）

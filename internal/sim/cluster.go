@@ -32,6 +32,8 @@ type Cluster struct {
 	OnCommit func(id raft.NodeID, ents []raft.Entry)
 	// OnSnapshot, if set, is invoked when a node must restore app state.
 	OnSnapshot func(id raft.NodeID, sn *raft.Snapshot)
+	// ManualDrain, when true, leaves Ready batches for an external driver.
+	manual bool
 }
 
 // ClusterOptions describes a cluster to create.
@@ -42,6 +44,11 @@ type ClusterOptions struct {
 	SnapshotThreshold int
 	// Addrs optionally maps ids to dial addresses (carried in configs).
 	Addrs map[raft.NodeID]string
+	// ManualDrain makes Tick only deliver network messages and advance
+	// node timers; Ready batches are left for an external driver (e.g. a
+	// kv.Service Run loop) to consume. The caller is also responsible for
+	// applying committed entries and reporting Applied positions.
+	ManualDrain bool
 }
 
 // NewCluster bootstraps a cluster where every listed id is a voter with
@@ -60,6 +67,7 @@ func NewCluster(opt ClusterOptions) *Cluster {
 		applied: map[raft.NodeID]raft.Index{},
 		addrs:   map[raft.NodeID]string{},
 		ranks:   map[raft.NodeID]int{},
+		manual:  opt.ManualDrain,
 	}
 	for k, v := range opt.Addrs {
 		c.addrs[k] = v
@@ -127,14 +135,25 @@ func (c *Cluster) Events() []LoggedEvent {
 	return out
 }
 
-// Leader returns the current leader id or "".
+// Leader returns the current leader id or "". During the brief split-brain
+// window more than one node may still claim leadership (a deposed leader
+// has not yet observed the newer term); the claimant in the HIGHEST term
+// is returned, ties broken by lowest id, so the choice is deterministic
+// across runs and matches what a term-aware client would retry against.
 func (c *Cluster) Leader() raft.NodeID {
-	for id, n := range c.nodes {
-		if n != nil && n.Role() == raft.RoleLeader {
-			return id
+	var best raft.NodeID
+	var bestTerm raft.Term
+	for _, id := range c.orderedAlive() {
+		n := c.nodes[id]
+		if n == nil || n.Role() != raft.RoleLeader {
+			continue
+		}
+		if best == "" || n.Term() > bestTerm ||
+			(n.Term() == bestTerm && id < best) {
+			best, bestTerm = id, n.Term()
 		}
 	}
-	return ""
+	return best
 }
 
 // LeaderTerm returns the current leader's term, or 0 with empty id.
@@ -167,6 +186,9 @@ func (c *Cluster) Tick() {
 	// 2. Node timers (deterministic id order).
 	for _, id := range c.orderedAlive() {
 		c.nodes[id].Tick()
+	}
+	if c.manual {
+		return
 	}
 	// 3. Drain Ready batches.
 	for _, id := range c.orderedAlive() {

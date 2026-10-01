@@ -47,6 +47,10 @@ type Service struct {
 	events chan raft.Event
 	stop   chan struct{}
 
+	// writeTO bounds how long a write proposal waits before the caller is
+	// told the outcome is unknown (retry with the same request id).
+	writeTO time.Duration
+
 	// MessageHook, if set, observes every raft message the node emits
 	// (used by the server driver to forward onto its transport).
 	MessageHook func(raft.Message)
@@ -57,14 +61,15 @@ type Service struct {
 // NewService constructs a Service.
 func NewService(n *raft.Node, st *Store) *Service {
 	s := &Service{
-		node:   n,
-		store:  st,
-		clock:  time.Now,
-		puts:   map[string]map[string]*pending{},
-		others: map[raft.ReqID]*pending{},
-		reads:  map[raft.ReqID]chan Result{},
-		events: make(chan raft.Event, 256),
-		stop:   make(chan struct{}),
+		node:    n,
+		store:   st,
+		clock:   time.Now,
+		puts:    map[string]map[string]*pending{},
+		others:  map[raft.ReqID]*pending{},
+		reads:   map[raft.ReqID]chan Result{},
+		events:  make(chan raft.Event, 256),
+		stop:    make(chan struct{}),
+		writeTO: 2 * time.Second,
 	}
 	// Auto-register so callers do not have to thread the sink through
 	// raft.Options (which would preclude other observers such as logs).
@@ -84,6 +89,15 @@ func (s *Service) EventSink() func(raft.Event) {
 
 // SetClock overrides the wall clock (deterministic tests).
 func (s *Service) SetClock(f func() time.Time) { s.clock = f }
+
+// SetWriteTimeout overrides how long a write waits for commit
+// confirmation before a timeout-unknown verdict is returned (deterministic
+// tests use a short value; production callers should keep it generous).
+func (s *Service) SetWriteTimeout(d time.Duration) {
+	if d > 0 {
+		s.writeTO = d
+	}
+}
 
 func newSessionID() string {
 	b := make([]byte, 12)
@@ -226,27 +240,77 @@ func (s *Service) proposeWrite(cmd Command, timeout time.Duration) Result {
 		data, _ := Encode(cmd)
 		s.node.Propose(rid, data)
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case res := <-ch:
 		return res
-	case <-time.After(timeout):
-		// CRITICAL: timeout means "outcome unknown", never success. The
-		// entry may still commit; later duplicate requests reconcile via
-		// the state machine's per-request reply cache. Remove the pending
-		// registration so a retry can issue a fresh proposal.
-		s.forgetPut(cmd.SessionID, cmd.RequestID)
-		return Result{Verdict: VerdictTimeout, Reason: "commit-not-confirmed-in-time"}
+	case <-timer.C:
+		// Timeout means "outcome unknown" TO THIS CALLER only. Detach just
+		// this waiter — concurrent duplicates keep sharing the proposal —
+		// and reconcile against the reply cache: if the entry committed in
+		// the meantime, return the decisive original verdict instead of
+		// unknown. The registration is removed only once nobody is waiting,
+		// so a later commit/rejection can never orphan other callers.
+		return s.detachTimedOutPut(cmd, ch)
 	case <-s.stop:
 		return Result{Verdict: VerdictNotLeader, Reason: "closing"}
 	}
 }
 
-func (s *Service) forgetPut(sessionID, requestID string) {
+// detachTimedOutPut removes one timed-out waiter channel and returns the
+// best decisive verdict available. If the shared proposal has since
+// committed, the reply cache yields the original verdict (with its
+// applied-at index and full detail); otherwise the caller gets the
+// honest timeout-unknown result and is expected to retry with the SAME
+// (session, request) pair.
+func (s *Service) detachTimedOutPut(cmd Command, ch <-chan Result) Result {
+	unknown := Result{Verdict: VerdictTimeout,
+		Reason: "commit-not-confirmed-in-time"}
 	s.mu.Lock()
-	if m := s.puts[sessionID]; m != nil {
-		delete(m, requestID)
+	defer s.mu.Unlock()
+	// The terminal result may have been delivered to ch concurrently with
+	// the timer (buffered channel); prefer it.
+	select {
+	case r := <-ch:
+		return r
+	default:
 	}
-	s.mu.Unlock()
+	m := s.puts[cmd.SessionID]
+	p := m[cmd.RequestID]
+	if p != nil {
+		rest := make([]chan Result, 0, len(p.waiters))
+		for _, w := range p.waiters {
+			if w != ch {
+				rest = append(rest, w)
+			}
+		}
+		p.waiters = rest
+		if len(rest) == 0 {
+			delete(m, cmd.RequestID)
+		}
+	}
+	// Reconcile: the entry may have committed/applied while we waited.
+	if rep, ok := s.store.PendingPut(cmd.SessionID, cmd.RequestID); ok {
+		return decisiveResultFromReply(rep)
+	}
+	return unknown
+}
+
+// decisiveResultFromReply rebuilds the caller-facing result of a request
+// whose verdict is already in the reply cache. The ORIGINAL verdict is
+// preserved (success, invalid-batch or precondition-failed with its
+// exact reason/detail) so a reconciled timeout and a directly committed
+// caller observe the same decisive conclusion.
+func decisiveResultFromReply(rep Reply) Result {
+	reason := rep.Reason
+	if reason == "" {
+		reason = "request-already-applied"
+	}
+	return Result{
+		Verdict: rep.Verdict, Value: rep.Value, Reason: reason,
+		Index: rep.AppliedAt, Version: rep.Version, Batch: rep.Batch,
+	}
 }
 
 // OpenSession creates a session and returns its id.
@@ -294,19 +358,22 @@ func (s *Service) Put(sessionID, requestID, key string, value []byte) Result {
 		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
 			Reason: raft.RejectNotLeader.String()}
 	}
-	known, closed := s.store.HasSession(sessionID)
-	if !known || closed {
-		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
-	}
 	// Fast path: same (session, request) already applied => return the
-	// original verdict without touching raft.
+	// original verdict without touching raft. This is checked before
+	// session liveness so a retry (e.g. after a leadership change that
+	// outlives the idle TTL) always converges onto the original verdict
+	// rather than a fresh session-expired one.
 	if rep, ok := s.store.PendingPut(sessionID, requestID); ok {
 		return Result{Verdict: VerdictDuplicate, Value: rep.Value, Index: rep.AppliedAt,
 			Reason: "request-already-applied"}
 	}
+	known, closed := s.store.HasSession(sessionID)
+	if !known || closed {
+		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
+	}
 	cmd := Command{Type: CmdPut, SessionID: sessionID, RequestID: requestID,
 		Key: key, Value: value, CreateTime: s.clock().UnixMilli()}
-	return s.proposeWrite(cmd, 2*time.Second)
+	return s.proposeWrite(cmd, s.writeTimeout())
 }
 
 // Batch proposes an atomic multi-key write. Each item may carry an
@@ -325,15 +392,16 @@ func (s *Service) Batch(sessionID, requestID string, items []BatchItem) Result {
 		return Result{Verdict: VerdictNotLeader, Leader: s.node.Leader(),
 			Reason: raft.RejectNotLeader.String()}
 	}
-	known, closed := s.store.HasSession(sessionID)
-	if !known || closed {
-		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
-	}
 	// Fast path: same (session, request) already applied => return the
-	// original, complete batch verdict without touching raft.
+	// original, complete batch verdict without touching raft. Checked
+	// before session liveness for the same convergence reason as Put.
 	if rep, ok := s.store.PendingPut(sessionID, requestID); ok {
 		return Result{Verdict: VerdictDuplicate, Reason: "request-already-applied",
 			Index: rep.AppliedAt, Batch: rep.Batch}
+	}
+	known, closed := s.store.HasSession(sessionID)
+	if !known || closed {
+		return Result{Verdict: VerdictSessionExpired, Reason: "session-unknown-or-closed"}
 	}
 	ops := make([]BatchOp, len(items))
 	for i, it := range items {
@@ -342,7 +410,7 @@ func (s *Service) Batch(sessionID, requestID string, items []BatchItem) Result {
 	}
 	cmd := Command{Type: CmdBatch, SessionID: sessionID, RequestID: requestID,
 		Ops: ops, CreateTime: s.clock().UnixMilli()}
-	return s.proposeWrite(cmd, 2*time.Second)
+	return s.proposeWrite(cmd, s.writeTimeout())
 }
 
 // joinOrRegisterPut atomically joins an in-flight request or registers
@@ -361,7 +429,7 @@ func (s *Service) joinOrRegisterPut(cmd Command) (<-chan Result, bool) {
 		p.waiters = append(p.waiters, ch)
 		return ch, true
 	}
-	p := &pending{kind: "put", cmd: cmd, deadline: s.clock().Add(2 * time.Second),
+	p := &pending{kind: "put", cmd: cmd, deadline: s.clock().Add(s.writeTO),
 		waiters: []chan Result{ch}}
 	m[cmd.RequestID] = p
 	return ch, false
@@ -416,6 +484,9 @@ func (s *Service) RemoveMember(id raft.NodeID) (raft.RejectReason, bool) {
 		Type: raft.ConfRemoveNode, Node: id,
 	})
 }
+
+// writeTimeout bounds waiting on commit confirmation.
+func (s *Service) writeTimeout() time.Duration { return s.writeTO }
 
 // readTimeout bounds waiting on the ReadIndex barrier.
 func (s *Service) readTimeout() time.Duration { return 2 * time.Second }
